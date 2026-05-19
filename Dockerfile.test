@@ -1,0 +1,27 @@
+# 在容器内跑 pytest（Python 3.10，满足项目 requires-python>=3.10）
+# 构建：docker build -f Dockerfile.test -t lightrag-hku-test .
+# 运行：见 scripts/run_kg_tests_docker.ps1
+
+FROM python:3.10-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
+        git \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir uv
+
+COPY pyproject.toml setup.py uv.lock ./
+COPY lightrag ./lightrag
+
+RUN uv sync --frozen --extra test --no-editable
+
+ENV PATH="/app/.venv/bin:$PATH"
+
+# tests/ 被根 .dockerignore 排除，运行时请挂载宿主 tests（见 ps1）
+CMD ["pytest", "tests/test_kg_pipeline_runner.py", "-v", "--tb=short"]

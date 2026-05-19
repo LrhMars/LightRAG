@@ -1,0 +1,97 @@
+services:
+  lightrag:
+    # 必须使用本地 build 的镜像，才会包含仓库里的 kg_pipeline / process_document 改动。
+    # 切勿仅用上游 ghcr.io 预构建镜像，否则永远跑默认 extract+merge。
+    image: lightrag:local
+    build:
+      context: .
+      # Dockerfile.local：不拉 Docker Hub 的 oven/bun、python:slim，适合国内弱网。
+      # 构建前请在宿主编译 WebUI：.\scripts\prepare_local_docker_build.ps1
+      # 或（已装本地 Node）.\scripts\build_webui_with_host_node.ps1；compose 已挂载 api/webui 时可日常只跑脚本、不必重建镜像。
+      # 网络正常且希望「一键全在镜像内构建」时，可改回 dockerfile: Dockerfile
+      dockerfile: Dockerfile.local
+    pull_policy: build
+    ports:
+      - "${HOST:-0.0.0.0}:${PORT:-9621}:9621"
+    volumes:
+      - ./data/rag_storage:/app/data/rag_storage
+      - ./data/inputs:/app/data/inputs
+      - ./scripts:/app/scripts
+      - ./config.ini:/app/config.ini
+      - ./.env:/app/.env
+      # 勿挂载整个 ./lightrag：会覆盖镜像内已构建的 api/webui，浏览器只会落到 /docs（Swagger）。
+      # 单独挂载 webui 目录：在宿主机用本地 Node 在 lightrag_webui 下执行 npm run build，
+      # 产物写入 lightrag/api/webui 后，容器内立刻生效，无需改 Dockerfile 或「在容器里调宿主 node」。
+      # 若宿主上 api/webui 为空，首次请先 build；或临时注释下一行，使用镜像内自带前端。
+      - ./lightrag/api/webui:/app/lightrag/api/webui
+      # FastAPI 路由（如本体可视化 GET /documents/kg_pipeline/.../ontology）；不挂载则容器内仍是镜像里旧路由 → 404。
+      - ./lightrag/api/routers:/app/lightrag/api/routers
+      # 必须：注册 /datasets 等路由在 lightrag_server.py 的 include_router；仅挂载 routers 不会自动挂上路由。
+      # 若镜像早于「数据集 API」提交构建，不挂此文件则 GET /datasets 永远 404。
+      - ./lightrag/api/lightrag_server.py:/app/lightrag/api/lightrag_server.py
+      # LightRAG 类上的 datasets KV 存储；镜像内无对应字段时列表/创建会 500，与宿主编码一致。
+      - ./lightrag/lightrag.py:/app/lightrag/lightrag.py
+      # document_routes 依赖的 coerce_raw_doc_status 等在 base.py；不挂载则新路由 + 旧 base → ImportError
+      - ./lightrag/base.py:/app/lightrag/base.py
+      # Json 文档状态：与手动构建、分页状态统计同一套逻辑时需与宿主一致
+      - ./lightrag/kg/json_doc_status_impl.py:/app/lightrag/kg/json_doc_status_impl.py
+      # 开发 kg_pipeline 时可挂载该目录，改 Python 后重启容器即可，无需整镜像重建。
+      - ./lightrag/kg_pipeline:/app/lightrag/kg_pipeline
+      - ./lightrag/prompt.py:/app/lightrag/prompt.py
+      # 超图索引命名空间常量（新增 KV_STORE_HYPEREDGE_INDEX）
+      - ./lightrag/namespace.py:/app/lightrag/namespace.py
+      # 条件边属性保留 + 超图检索上下文注入
+      - ./lightrag/operate.py:/app/lightrag/operate.py
+      # 层级感知切片（新建文件，镜像内不存在）
+      - ./lightrag/chunking.py:/app/lightrag/chunking.py
+      # Agent 层：session_manager/orchestrator/tools/hyper_agent/query_planner/multi_mode_agent 等均有改动
+      # 不挂载整个 lightrag/ 避免覆盖镜像内构建的 webui；只挂 agent 子目录即可
+      - ./lightrag/agent:/app/lightrag/agent
+      # utils.py：safe_vdb_operation_with_exception 等工具函数
+      - ./lightrag/utils.py:/app/lightrag/utils.py
+      # kg/nano_vector_db_impl.py：upsert 批量 embedding 逻辑
+      - ./lightrag/kg/nano_vector_db_impl.py:/app/lightrag/kg/nano_vector_db_impl.py
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    deploy:
+      restart_policy:
+        condition: on-failure
+        max_attempts: 10
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      WORKING_DIR: "/app/data/rag_storage"
+      INPUT_DIR: "/app/data/inputs"
+      HOST: "0.0.0.0"
+      PORT: "9621"
+      # 与同 compose 中的 neo4j 服务通信（覆盖 .env 里面向宿主机的 URI）
+      NEO4J_URI: neo4j://neo4j:7687
+
+  neo4j:
+    image: neo4j:5-community
+    # 若宿主机已有 Neo4j 占用 7687/7474，请改掉口映射，例如 "7688:7687"
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+    environment:
+      NEO4J_AUTH: ${NEO4J_USERNAME}/${NEO4J_PASSWORD}
+      NEO4J_dbms_default__database: ${NEO4J_DATABASE:-neo4j}
+      _HEALTH_USER: ${NEO4J_USERNAME}
+      _HEALTH_PASS: ${NEO4J_PASSWORD}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'cypher-shell -a bolt://localhost:7687 -u "$$_HEALTH_USER" -p "$$_HEALTH_PASS" "RETURN 1" || exit 1',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    restart: unless-stopped
+
+volumes:
+  neo4j_data:
